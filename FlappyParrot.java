@@ -1,7 +1,7 @@
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.*;
-import java.io.*;
+import java.sql.*;
 import java.util.*;
 import java.util.List;
 import javax.swing.Timer;
@@ -18,23 +18,23 @@ public class FlappyParrot {
             GamePanel gamePanel = new GamePanel();
             frame.add(gamePanel);
 
-            frame.addKeyListener(new KeyAdapter() {
+            gamePanel.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+                     .put(KeyStroke.getKeyStroke(KeyEvent.VK_F11, 0), "toggleFullScreen");
+            gamePanel.getActionMap().put("toggleFullScreen", new AbstractAction() {
                 @Override
-                public void keyPressed(KeyEvent e) {
-                    if (e.getKeyCode() == KeyEvent.VK_F11) {
-                        if (frame.getExtendedState() == JFrame.MAXIMIZED_BOTH) {
-                            frame.dispose();
-                            frame.setUndecorated(false);
-                            frame.setExtendedState(JFrame.NORMAL);
-                            frame.setVisible(true);
-                        } else {
-                            frame.dispose();
-                            frame.setUndecorated(true);
-                            frame.setExtendedState(JFrame.MAXIMIZED_BOTH);
-                            frame.setVisible(true);
-                        }
-                        gamePanel.requestFocusInWindow();
+                public void actionPerformed(ActionEvent e) {
+                    frame.dispose();
+                    if (frame.getExtendedState() == JFrame.MAXIMIZED_BOTH) {
+                        frame.setUndecorated(false);
+                        frame.setExtendedState(JFrame.NORMAL);
+                        frame.setSize(800, 600);
+                        frame.setLocationRelativeTo(null);
+                    } else {
+                        frame.setUndecorated(true);
+                        frame.setExtendedState(JFrame.MAXIMIZED_BOTH);
                     }
+                    frame.setVisible(true);
+                    gamePanel.requestFocusInWindow();
                 }
             });
 
@@ -45,15 +45,21 @@ public class FlappyParrot {
 }
 
 class GamePanel extends JPanel {
-    private enum State { MENU, LOADING, PLAYING, GAMEOVER, LEADERBOARD }
+    private enum State { MENU, AUTH, LOADING, PLAYING, GAMEOVER, LEADERBOARD }
     private State currentState = State.MENU;
 
     private int score = 0;
     private int highscore = 0;
     private int loadProgress = 0;
     private double gameSpeed = 4.0;
-    private String pilotName = "PILOT";
-    private final String DATA_FILE = "scores.dat";
+    private String pilotName = "GUEST";
+    private boolean isLoggedIn = false;
+
+    private boolean isRegisterMode = false;
+    private String typedUser = "";
+    private String typedPass = "";
+    private boolean typingPassword = false;
+    private String authErrorMessage = "";
 
     private Bird bird;
     private ArrayList<Pipe> pipes;
@@ -67,16 +73,27 @@ class GamePanel extends JPanel {
     public GamePanel() {
         setPreferredSize(new Dimension(800, 600));
         setFocusable(true);
-        loadHighScores();
         setupEnvironment();
         setupInput();
+        loadHighScoresFromDB();
+        
+        Timer renderTimer = new Timer(16, e -> {
+            if (currentState != State.PLAYING && currentState != State.LOADING) {
+                updateMenuEnvironment();
+                repaint();
+            }
+        });
+        renderTimer.start();
+    }
+
+    private Connection connect() throws SQLException {
+        return DriverManager.getConnection("jdbc:mysql://localhost:3307/flappy_db", "root", "");
     }
 
     private void setupEnvironment() {
         clouds = new ArrayList<>();
         pipes = new ArrayList<>();
         stars = new ArrayList<>();
-        
         for (int i = 0; i < 50; i++) stars.add(new Star(rand.nextInt(2000), rand.nextInt(1000)));
         for (int i = 0; i < 6; i++) clouds.add(new Cloud(rand.nextInt(2000), rand.nextInt(300)));
     }
@@ -86,15 +103,48 @@ class GamePanel extends JPanel {
             @Override
             public void keyPressed(KeyEvent e) {
                 int code = e.getKeyCode();
+                
+                if (currentState == State.AUTH) {
+                    if (code == KeyEvent.VK_ESCAPE) {
+                        currentState = State.MENU;
+                        authErrorMessage = "";
+                    } else if (code == KeyEvent.VK_TAB) {
+                        typingPassword = !typingPassword;
+                    } else if (code == KeyEvent.VK_ENTER) {
+                        processEmbeddedAuth();
+                    } else if (code == KeyEvent.VK_BACK_SPACE) {
+                        if (!typingPassword && typedUser.length() > 0) {
+                            typedUser = typedUser.substring(0, typedUser.length() - 1);
+                        } else if (typingPassword && typedPass.length() > 0) {
+                            typedPass = typedPass.substring(0, typedPass.length() - 1);
+                        }
+                    }
+                    return;
+                }
+
                 if (currentState == State.MENU) {
-                    if (code == KeyEvent.VK_SPACE) startLoading();
-                    if (code == KeyEvent.VK_L) currentState = State.LEADERBOARD;
+                    if (code == KeyEvent.VK_SPACE) handleLaunchTrigger();
+                    if (code == KeyEvent.VK_L) { loadHighScoresFromDB(); currentState = State.LEADERBOARD; }
                 } else if (currentState == State.PLAYING) {
                     if (code == KeyEvent.VK_SPACE) bird.jump();
                 } else if (currentState == State.GAMEOVER) {
                     if (code == KeyEvent.VK_SPACE) goToMenu();
                 } else if (currentState == State.LEADERBOARD) {
                     if (code == KeyEvent.VK_ESCAPE || code == KeyEvent.VK_SPACE) currentState = State.MENU;
+                }
+            }
+
+            @Override
+            public void keyTyped(KeyEvent e) {
+                if (currentState == State.AUTH) {
+                    char c = e.getKeyChar();
+                    if (c != '\n' && c != '\t' && c != '\b' && c != '\u001B') {
+                        if (!typingPassword && typedUser.length() < 15) {
+                            typedUser += Character.toString(c).toUpperCase();
+                        } else if (typingPassword && typedPass.length() < 20) {
+                            typedPass += Character.toString(c);
+                        }
+                    }
                 }
             }
         });
@@ -104,11 +154,25 @@ class GamePanel extends JPanel {
             public void mousePressed(MouseEvent e) {
                 int mx = e.getX(), my = e.getY();
                 int cx = getWidth() / 2;
+                int cy = getHeight() / 2;
+
                 if (currentState == State.MENU) {
-                    if (checkBounds(mx, my, cx - 100, 280, 200, 50)) startLoading();
-                    else if (checkBounds(mx, my, cx - 100, 340, 200, 50)) updateName();
-                    else if (checkBounds(mx, my, cx - 100, 400, 200, 50)) currentState = State.LEADERBOARD;
-                    else if (checkBounds(mx, my, cx - 100, 460, 200, 50)) System.exit(0);
+                    if (checkBounds(mx, my, cx - 120, 260, 240, 45)) handleLaunchTrigger();
+                    else if (checkBounds(mx, my, cx - 120, 315, 240, 45)) { triggerEmbeddedAuth(false); }
+                    else if (checkBounds(mx, my, cx - 120, 370, 240, 45)) { loadHighScoresFromDB(); currentState = State.LEADERBOARD; }
+                    else if (checkBounds(mx, my, cx - 120, 425, 240, 45)) System.exit(0);
+                } else if (currentState == State.AUTH) {
+                    if (checkBounds(mx, my, cx - 160, cy - 35, 320, 35)) typingPassword = false;
+                    else if (checkBounds(mx, my, cx - 160, cy + 30, 320, 35)) typingPassword = true;
+                    else if (checkBounds(mx, my, cx - 160, cy + 90, 150, 40)) {
+                        processEmbeddedAuth();
+                    } else if (checkBounds(mx, my, cx + 10, cy + 90, 150, 40)) {
+                        isRegisterMode = !isRegisterMode;
+                        authErrorMessage = "";
+                    } else if (checkBounds(mx, my, cx - 160, cy + 145, 320, 35)) {
+                        currentState = State.MENU;
+                        authErrorMessage = "";
+                    }
                 } else if (currentState == State.PLAYING) {
                     bird.jump();
                 } else if (currentState == State.GAMEOVER || currentState == State.LEADERBOARD) {
@@ -122,11 +186,108 @@ class GamePanel extends JPanel {
         return mx >= x && mx <= x + w && my >= y && my <= y + h;
     }
 
-    private void updateName() {
-        String n = JOptionPane.showInputDialog(this, "Identify Pilot:", pilotName);
-        if (n != null && !n.trim().isEmpty()) {
-            pilotName = n.trim().toUpperCase();
-            if (pilotName.length() > 10) pilotName = pilotName.substring(0, 10);
+    private void handleLaunchTrigger() {
+        if (!isLoggedIn) {
+            triggerEmbeddedAuth(false);
+            authErrorMessage = "Authentication Required To Fly.";
+        } else {
+            startLoading();
+        }
+    }
+
+    private void triggerEmbeddedAuth(boolean register) {
+        typedUser = "";
+        typedPass = "";
+        typingPassword = false;
+        authErrorMessage = "";
+        isRegisterMode = register;
+        currentState = State.AUTH;
+    }
+
+    private void processEmbeddedAuth() {
+        if (typedUser.trim().isEmpty() || typedPass.isEmpty()) {
+            authErrorMessage = "Credentials cannot be blank.";
+            return;
+        }
+
+        if (isRegisterMode) {
+            try (Connection conn = connect()) {
+                PreparedStatement check = conn.prepareStatement("SELECT * FROM game_users WHERE username=?");
+                check.setString(1, typedUser.trim());
+                if (check.executeQuery().next()) {
+                    authErrorMessage = "Username is already occupied.";
+                    return;
+                }
+                PreparedStatement pst = conn.prepareStatement("INSERT INTO game_users VALUES (?, ?)");
+                pst.setString(1, typedUser.trim());
+                pst.setString(2, typedPass);
+                pst.executeUpdate();
+
+                pilotName = typedUser.trim();
+                isLoggedIn = true;
+                highscore = 0;
+                currentState = State.MENU;
+            } catch (Exception ex) {
+                authErrorMessage = "Database Error.";
+            }
+        } else {
+            try (Connection conn = connect()) {
+                PreparedStatement pst = conn.prepareStatement("SELECT * FROM game_users WHERE username=? AND password=?");
+                pst.setString(1, typedUser.trim());
+                pst.setString(2, typedPass);
+                ResultSet rs = pst.executeQuery();
+
+                if (rs.next()) {
+                    pilotName = typedUser.trim();
+                    isLoggedIn = true;
+                    loadUserHighScore();
+                    currentState = State.MENU;
+                } else {
+                    authErrorMessage = "Invalid credentials configuration.";
+                }
+            } catch (Exception ex) {
+                authErrorMessage = "Connection Error.";
+            }
+        }
+    }
+
+    private void loadUserHighScore() {
+        try (Connection conn = connect()) {
+            PreparedStatement pst = conn.prepareStatement("SELECT MAX(score) FROM game_scores WHERE username=?");
+            pst.setString(1, pilotName);
+            ResultSet rs = pst.executeQuery();
+            if (rs.next()) {
+                highscore = rs.getInt(1);
+            }
+        } catch (Exception ex) { ex.printStackTrace(); }
+    }
+
+    private void loadHighScoresFromDB() {
+        leaderboard.clear();
+        try (Connection conn = connect()) {
+            ResultSet rs = conn.createStatement().executeQuery(
+                "SELECT username, MAX(score) as top_score FROM game_scores GROUP BY username ORDER BY top_score DESC LIMIT 10"
+            );
+            while (rs.next()) {
+                leaderboard.add(new ScoreEntry(rs.getString("username"), rs.getInt("top_score")));
+            }
+            if (!leaderboard.isEmpty() && isLoggedIn) {
+                loadUserHighScore();
+            }
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+    }
+
+    private void saveScoreToDB(int s) {
+        if (!isLoggedIn) return;
+        try (Connection conn = connect()) {
+            PreparedStatement pst = conn.prepareStatement("INSERT INTO game_scores (username, score) VALUES (?, ?)");
+            pst.setString(1, pilotName);
+            pst.setInt(2, s);
+            pst.executeUpdate();
+        } catch (Exception ex) {
+            ex.printStackTrace();
         }
     }
 
@@ -155,9 +316,13 @@ class GamePanel extends JPanel {
         repaint();
     }
 
-    private void update() {
+    private void updateMenuEnvironment() {
         for (Star s : stars) s.update(gameSpeed * 0.1, getWidth());
         for (Cloud c : clouds) c.update(gameSpeed * 0.2, getWidth());
+    }
+
+    private void update() {
+        updateMenuEnvironment();
 
         if (currentState == State.LOADING) {
             loadProgress += 2;
@@ -192,7 +357,7 @@ class GamePanel extends JPanel {
 
     private void endGame() {
         currentState = State.GAMEOVER;
-        saveScore(pilotName, score);
+        saveScoreToDB(score);
     }
 
     @Override
@@ -209,6 +374,7 @@ class GamePanel extends JPanel {
 
         switch (currentState) {
             case MENU -> drawMenu(g2);
+            case AUTH -> drawEmbeddedAuth(g2);
             case LOADING -> drawLoading(g2);
             case PLAYING -> {
                 for (Pipe p : pipes) p.draw(g2, getHeight());
@@ -250,18 +416,67 @@ class GamePanel extends JPanel {
     private void drawMenu(Graphics2D g) {
         int cx = getWidth() / 2;
         drawOverlay(g, 0.6f);
-        drawShadowText(g, "FLAPPY PARROT", cx, 150, 80, Color.WHITE);
-        drawShadowText(g, "ELITE PILOT: " + pilotName, cx, 210, 22, Color.YELLOW);
-        drawModernButton(g, cx - 100, 280, 200, 50, "LAUNCH", new Color(39, 174, 96));
-        drawModernButton(g, cx - 100, 340, 200, 50, "PILOT I.D.", new Color(41, 128, 185));
-        drawModernButton(g, cx - 100, 400, 200, 50, "RECORDS", new Color(142, 68, 173));
-        drawModernButton(g, cx - 100, 460, 200, 50, "TERMINATE", new Color(192, 57, 43));
-        drawShadowText(g, "HI-SCORE: " + highscore, cx, getHeight() - 40, 18, Color.LIGHT_GRAY);
+        drawShadowText(g, "FLAPPY PARROT", cx, 140, 75, Color.WHITE);
+        
+        String loginStatusString = isLoggedIn ? "PILOT STATUS: " + pilotName : "AUTHENTICATION REQUIRED";
+        drawShadowText(g, loginStatusString, cx, 200, 20, isLoggedIn ? Color.YELLOW : new Color(231, 76, 60));
+        
+        drawModernButton(g, cx - 120, 260, 240, 45, "LAUNCH", new Color(39, 174, 96));
+        drawModernButton(g, cx - 120, 315, 240, 45, isLoggedIn ? "SWITCH ACCOUNT" : "LOGIN / REGISTER", new Color(41, 128, 185));
+        drawModernButton(g, cx - 120, 370, 240, 45, "RECORDS", new Color(142, 68, 173));
+        drawModernButton(g, cx - 120, 425, 240, 45, "EXIT", new Color(192, 57, 43));
+        
+        drawShadowText(g, "RECORDED PERSONAL BEST: " + highscore, cx, getHeight() - 40, 16, Color.LIGHT_GRAY);
+    }
+
+    private void drawEmbeddedAuth(Graphics2D g) {
+        int cx = getWidth() / 2;
+        int cy = getHeight() / 2;
+        drawOverlay(g, 0.85f);
+
+        g.setColor(new Color(20, 30, 50, 220));
+        g.fillRoundRect(cx - 200, cy - 180, 400, 380, 16, 16);
+        g.setColor(new Color(255, 255, 255, 40));
+        g.drawRoundRect(cx - 200, cy - 180, 400, 380, 16, 16);
+
+        drawShadowText(g, isRegisterMode ? "REGISTER" : "LOGIN", cx, cy - 130, 26, Color.WHITE);
+        
+        if (!authErrorMessage.isEmpty()) {
+            drawShadowText(g, authErrorMessage, cx, cy - 85, 14, new Color(231, 76, 60));
+        }
+
+        drawShadowText(g, "USERNAME", cx, cy - 45, 13, Color.GRAY);
+        g.setColor(typingPassword ? new Color(30, 40, 60) : new Color(50, 70, 100));
+        g.fillRoundRect(cx - 160, cy - 35, 320, 35, 8, 8);
+        g.setColor(typingPassword ? Color.DARK_GRAY : Color.CYAN);
+        g.drawRoundRect(cx - 160, cy - 35, 320, 35, 8, 8);
+        
+        g.setFont(new Font("SansSerif", Font.PLAIN, 16));
+        g.setColor(Color.WHITE);
+        String renderUserStr = typedUser + (!typingPassword && (System.currentTimeMillis() / 500 % 2 == 0) ? "|" : "");
+        FontMetrics fmUser = g.getFontMetrics();
+        g.drawString(renderUserStr, cx - fmUser.stringWidth(renderUserStr) / 2, cy - 12);
+
+        drawShadowText(g, "SECURITY KEY (PASSWORD)", cx, cy + 20, 13, Color.GRAY);
+        g.setColor(!typingPassword ? new Color(30, 40, 60) : new Color(50, 70, 100));
+        g.fillRoundRect(cx - 160, cy + 30, 320, 35, 8, 8);
+        g.setColor(!typingPassword ? Color.DARK_GRAY : Color.CYAN);
+        g.drawRoundRect(cx - 160, cy + 30, 320, 35, 8, 8);
+        
+        g.setFont(new Font("SansSerif", Font.PLAIN, 16));
+        g.setColor(Color.WHITE);
+        String masked = "*".repeat(typedPass.length()) + (typingPassword && (System.currentTimeMillis() / 500 % 2 == 0) ? "|" : "");
+        FontMetrics fmPass = g.getFontMetrics();
+        g.drawString(masked, cx - fmPass.stringWidth(masked) / 2, cy + 53);
+
+        drawModernButton(g, cx - 160, cy + 90, 150, 40, isRegisterMode ? "SUBMIT REG" : "SIGN IN", new Color(39, 174, 96));
+        drawModernButton(g, cx + 10, cy + 90, 150, 40, isRegisterMode ? "TO LOGIN" : "TO REGISTER", new Color(41, 128, 185));
+        drawModernButton(g, cx - 160, cy + 145, 320, 35, "CANCEL SYSTEM", new Color(192, 57, 43));
     }
 
     private void drawLoading(Graphics2D g) {
         int cx = getWidth() / 2;
-        drawShadowText(g, "CALIBRATING ENGINES...", cx, 280, 25, Color.WHITE);
+        drawShadowText(g, "LOADING THE GAME...", cx, 280, 25, Color.WHITE);
         g.setColor(new Color(255, 255, 255, 50));
         g.fillRoundRect(cx - 150, 310, 300, 15, 10, 10);
         g.setColor(new Color(46, 204, 113));
@@ -270,7 +485,7 @@ class GamePanel extends JPanel {
 
     private void drawHUD(Graphics2D g) {
         drawShadowText(g, "SCORE: " + score, 100, 60, 35, Color.WHITE);
-        drawShadowText(g, "SPD: " + String.format("%.1f", gameSpeed), getWidth() - 100, 60, 20, Color.CYAN);
+        drawShadowText(g, "SPD: " + String.format("%.1f", gameSpeed), getWidth() - 100, 60, 20, Color.WHITE);
     }
 
     private void drawGameOverOverlay(Graphics2D g) {
@@ -278,7 +493,7 @@ class GamePanel extends JPanel {
         drawOverlay(g, 0.8f);
         drawShadowText(g, "MISSION FAILED", cx, 240, 70, new Color(231, 76, 60));
         drawShadowText(g, "FINAL DATA RECOVERED: " + score, cx, 310, 28, Color.WHITE);
-        drawShadowText(g, "PRESS SPACE TO RETURN TO BASE", cx, 400, 20, Color.LIGHT_GRAY);
+        drawShadowText(g, "PRESS SPACE TO RETURN TO MENU", cx, 400, 20, Color.LIGHT_GRAY);
     }
 
     private void drawLeaderboard(Graphics2D g) {
@@ -318,25 +533,7 @@ class GamePanel extends JPanel {
         g.fillRoundRect(x, y, w, h, 12, 12);
         g.setColor(new Color(255, 255, 255, 100));
         g.drawRoundRect(x, y, w, h, 12, 12);
-        drawShadowText(g, t, x + w / 2, y + h / 2 + 8, 18, Color.WHITE);
-    }
-
-    private void loadHighScores() {
-        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(DATA_FILE))) {
-            leaderboard = (List<ScoreEntry>) ois.readObject();
-            if (!leaderboard.isEmpty()) highscore = leaderboard.get(0).score;
-        } catch (Exception e) {
-            leaderboard = new ArrayList<>();
-        }
-    }
-
-    private void saveScore(String name, int s) {
-        leaderboard.add(new ScoreEntry(name, s));
-        Collections.sort(leaderboard);
-        if (leaderboard.size() > 10) leaderboard = leaderboard.subList(0, 10);
-        try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(DATA_FILE))) {
-            oos.writeObject(leaderboard);
-        } catch (Exception ignored) {}
+        drawShadowText(g, t, x + w / 2, y + h / 2 + 6, 16, Color.WHITE);
     }
 }
 
@@ -433,9 +630,7 @@ class Star {
     }
 }
 
-class ScoreEntry implements Serializable, Comparable<ScoreEntry> {
-    private static final long serialVersionUID = 1L;
+class ScoreEntry {
     String name; int score;
     public ScoreEntry(String n, int s) { this.name = n; this.score = s; }
-    @Override public int compareTo(ScoreEntry o) { return Integer.compare(o.score, this.score); }
 }
